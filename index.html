@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>TAMTAM POS</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+<style>
+:root{--bg:#f2f0f7;--card:#fff;--ink:#241b33;--mut:#7b7190;--acc:#5b3fa0;--ok:#3f7d55;--bad:#b3392f;--line:#e2dcee}
+*{box-sizing:border-box}
+body{margin:0;font:16px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--ink);padding:env(safe-area-inset-top) 0 80px}
+main{max-width:720px;margin:0 auto;padding:12px}
+h1{font-size:20px;margin:12px 0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;margin-bottom:10px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
+.off{opacity:.45}
+.row{display:flex;gap:8px;align-items:center;justify-content:space-between;margin:6px 0}
+.vs{display:flex;flex-direction:column;gap:6px;margin-top:8px}
+button{min-height:44px;padding:0 14px;border:1px solid var(--line);background:#fff;color:var(--ink);border-radius:8px;font:inherit;cursor:pointer}
+button.pri{background:var(--acc);color:#fff;border-color:var(--acc)}
+button.bad{color:var(--bad)}
+button:disabled{opacity:.5}
+input,select{min-height:44px;padding:0 10px;border:1px solid var(--line);border-radius:8px;font:inherit;width:100%;min-width:0}
+input[type=checkbox]{width:22px;min-height:22px}
+:focus-visible{outline:3px solid var(--acc);outline-offset:1px}
+nav{position:fixed;bottom:0;left:0;right:0;display:flex;background:#fff;border-top:1px solid var(--line);padding-bottom:env(safe-area-inset-bottom)}
+nav button{flex:1;border:0;border-radius:0;min-height:56px;color:var(--mut)}
+nav button.on{color:var(--acc);font-weight:700;box-shadow:inset 0 3px var(--acc)}
+.big{font-size:28px;font-weight:700}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.stats .card{margin:0;text-align:center}
+small,.mut{color:var(--mut)}
+pre{background:#f7f5fb;padding:12px;border-radius:8px;overflow-x:auto;font-size:14px}
+#modal{position:fixed;inset:0;background:#241b3399;display:none;align-items:center;justify-content:center;padding:16px}
+#modal .box{background:#fff;border-radius:12px;padding:16px;max-width:420px;width:100%;max-height:90vh;overflow:auto}
+.tag{font-size:13px;padding:2px 8px;border-radius:99px;background:var(--line)}
+</style>
+</head>
+<body>
+<main id="app"></main>
+<div id="modal"><div class="box" id="mbox"></div></div>
+<script>
+// ====== CONFIG: paste your Supabase values (Project Settings > API) ======
+const SB_URL = 'https://sxfnhkflfrrzbjnekwji.supabase.co/rest/v1/';
+const SB_KEY = 'sb_publishable_gN-UwYbpgoP3O-yev7W_dw_KhlleO23';
+const STALL = 'TAMTAM Milk Tea';
+// =========================================================================
+const sb = supabase.createClient(SB_URL, SB_KEY);
+const $ = s => document.querySelector(s);
+const peso = n => '₱' + Number(n).toFixed(2);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fdt = d => new Date(d).toLocaleString('en-PH', {timeZone:'Asia/Manila'});
+const manila = (back = 0) => new Date(Date.now() - back * 864e5).toLocaleDateString('en-CA', {timeZone:'Asia/Manila'});
+let products = [], cart = [], cashVal = '', tab = 'pos', started = false;
+
+// ---------- auth ----------
+async function boot() {
+  const { data: { session } } = await sb.auth.getSession();
+  session ? start() : loginView();
+}
+function loginView() {
+  started = false;
+  $('#app').innerHTML = `<h1>TAMTAM POS</h1><form class="card" onsubmit="login(event)">
+    <label>Email<input id="em" type="email" required autocomplete="username"></label><br><br>
+    <label>Password<input id="pw" type="password" required autocomplete="current-password"></label>
+    <p id="err" style="color:var(--bad)" role="alert"></p>
+    <button class="pri" style="width:100%">Log in</button></form>`;
+  document.querySelector('nav')?.remove();
+}
+async function login(e) {
+  e.preventDefault();
+  const { error } = await sb.auth.signInWithPassword({ email: $('#em').value, password: $('#pw').value });
+  if (error) $('#err').textContent = 'Login failed: ' + error.message; else start();
+}
+async function logout() { await sb.auth.signOut(); cart = []; loginView(); }
+
+// ---------- data ----------
+async function load() {
+  const { data, error } = await sb.from('products').select('*,variants(*)').eq('archived', false).order('name');
+  if (error) return alert('Could not load products: ' + error.message);
+  products = data.map(p => ({ ...p, variants: p.variants.filter(v => !v.archived).sort((a, b) => a.price - b.price) }));
+  // drop cart lines that became unavailable
+  const ok = new Set(products.filter(p => p.available).flatMap(p => p.variants.map(v => v.id)));
+  cart = cart.filter(c => ok.has(c.id));
+}
+async function start() {
+  if (started) return; started = true;
+  await load();
+  sb.channel('menu').on('postgres_changes', { event: '*', schema: 'public', table: 'products' }, sync)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'variants' }, sync).subscribe();
+  show('pos');
+}
+async function sync() { await load(); if (tab === 'pos') show('pos'); }
+
+// ---------- shell ----------
+function show(t) {
+  tab = t;
+  const tabs = [['pos', 'Order'], ['prods', 'Products'], ['dash', 'Sales'], ['audit', 'Audit log']];
+  if (!$('nav')) document.body.insertAdjacentHTML('beforeend', '<nav></nav>');
+  $('nav').innerHTML = tabs.map(([k, l]) => `<button class="${k === t ? 'on' : ''}" onclick="show('${k}')">${l}</button>`).join('') +
+    '<button onclick="logout()">Log out</button>';
+  const v = { pos: posView, prods: prodView, dash: dashView, audit: auditView }[t]();
+  $('#app').innerHTML = v;
+  if (t === 'pos') renderCart();
+  if (t === 'dash') setRange(0);
+  if (t === 'audit') loadAudit();
+}
+
+// ---------- order (POS) ----------
+function posView() {
+  return `<h1>New order</h1><div class="grid">${products.map(p => `<div class="card ${p.available ? '' : 'off'}">
+    <b>${esc(p.name)}</b>${p.available ? '' : '<br><small>Unavailable</small>'}
+    <div class="vs">${p.variants.map(v => `<button ${p.available ? '' : 'disabled'} onclick="add('${v.id}')">${esc(v.label)} · ${peso(v.price)}</button>`).join('')}</div></div>`).join('') ||
+    '<p class="mut">No products yet. Open Products and add your first drink.</p>'}</div><div id="cart"></div>`;
+}
+function add(id) {
+  const ex = cart.find(c => c.id === id);
+  if (ex) ex.qty++;
+  else for (const p of products) { const v = p.variants.find(v => v.id === id); if (v) cart.push({ id, name: p.name, label: v.label, price: +v.price, qty: 1 }); }
+  renderCart();
+}
+function qty(id, d) { const c = cart.find(c => c.id === id); c.qty += d; if (c.qty < 1) cart = cart.filter(x => x !== c); renderCart(); }
+const total = () => cart.reduce((s, c) => s + c.price * c.qty, 0);
+function renderCart() {
+  if (!$('#cart')) return;
+  $('#cart').innerHTML = `<h1>Current order</h1><div class="card">${cart.map(c => `<div class="row"><span>${esc(c.name)} <small>${esc(c.label)}</small></span>
+    <span style="display:flex;gap:6px;align-items:center"><button onclick="qty('${c.id}',-1)" aria-label="Less">−</button><b>${c.qty}</b><button onclick="qty('${c.id}',1)" aria-label="More">+</button></span>
+    <b>${peso(c.price * c.qty)}</b></div>`).join('') || '<p class="mut">Tap a drink above to start.</p>'}
+    <div class="row"><span>Total</span><span class="big">${peso(total())}</span></div>
+    <label>Cash tendered<input id="cash" type="number" inputmode="decimal" min="0" step="0.01" value="${cashVal}" oninput="cashVal=this.value;chg()"></label>
+    <div class="row"><span>Change due</span><b id="chg"></b></div>
+    <div class="row"><button class="bad" onclick="voidOrder()" ${cart.length ? '' : 'disabled'}>Void order</button>
+    <button class="pri" style="flex:1" onclick="charge()" ${cart.length ? '' : 'disabled'}>Review receipt</button></div></div>`;
+  chg();
+}
+function chg() {
+  const c = parseFloat(cashVal), t = total();
+  $('#chg').textContent = isNaN(c) ? '—' : c >= t ? peso(c - t) : 'Short by ' + peso(t - c);
+}
+const rtxt = (o, items, cash) => {
+  const w = 32, L = [STALL, fdt(o.created_at), 'Order #' + o.order_no, '-'.repeat(w)];
+  items.forEach(i => L.push(`${i.qty}x ${i.name} (${i.label})`.slice(0, 22).padEnd(22) + (i.price * i.qty).toFixed(2).padStart(w - 22)));
+  const t = items.reduce((s, i) => s + i.price * i.qty, 0), row = (a, b) => a.padEnd(22) + b.toFixed(2).padStart(w - 22);
+  L.push('-'.repeat(w), row('TOTAL', t), row('Cash', cash), row('Change', cash - t), 'Payment: Cash', 'Thank you!');
+  return L.join('\n');
+};
+function modal(html) { $('#mbox').innerHTML = html; $('#modal').style.display = 'flex'; }
+const closeModal = () => $('#modal').style.display = 'none';
+function charge() {
+  const c = parseFloat(cashVal);
+  if (!cart.length) return alert('Add at least one item.');
+  if (isNaN(c) || c < total()) return alert('Cash tendered is less than the total.');
+  modal(`<h1>Confirm with customer</h1><pre>${esc(rtxt({ created_at: new Date(), order_no: '(pending)' }, cart, c))}</pre>
+    <div class="row"><button onclick="closeModal()">Back</button><button class="pri" id="pay" style="flex:1" onclick="pay()">Confirm payment</button></div>`);
+}
+async function pay() {
+  $('#pay').disabled = true;
+  const cash = parseFloat(cashVal), items = cart.map(c => ({ ...c }));
+  const { data: o, error } = await sb.rpc('place_order', { p_items: items.map(i => ({ id: i.id, qty: i.qty })), p_cash: cash, p_status: 'paid' });
+  if (error) { $('#pay').disabled = false; return alert('Could not save order: ' + error.message); }
+  const txt = rtxt(o, items, cash);
+  window._rcpt = { txt, no: o.order_no };
+  cart = []; cashVal = '';
+  modal(`<h1>Paid</h1><pre>${esc(txt)}</pre><div class="row"><button onclick="dl()">Save .txt</button><button class="pri" style="flex:1" onclick="closeModal();renderCart()">New order</button></div>`);
+}
+function dl() {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([_rcpt.txt], { type: 'text/plain' }));
+  a.download = `tamtam-order-${_rcpt.no}.txt`; a.click();
+}
+async function voidOrder() {
+  if (!confirm('Void this order? It will be recorded in the audit log.')) return;
+  const { error } = await sb.rpc('place_order', { p_items: cart.map(c => ({ id: c.id, qty: c.qty })), p_cash: 0, p_status: 'voided' });
+  if (error) return alert('Could not void: ' + error.message);
+  cart = []; cashVal = ''; renderCart();
+}
+
+// ---------- products ----------
+function prodView() {
+  return `<h1>Products</h1><form class="card" onsubmit="addProd(event)"><b>New product</b>
+    <input id="pn" placeholder="Name, e.g. Wintermelon" required style="margin:8px 0">
+    <div class="row"><input id="pl" placeholder="Size or flavor, e.g. Medium" required><input id="pp" type="number" step="0.01" min="0" placeholder="Price" required></div>
+    <button class="pri" style="width:100%">Add product</button></form>` +
+    products.map(p => `<div class="card"><div class="row"><b>${esc(p.name)}</b>
+    <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" ${p.available ? 'checked' : ''} onchange="setAvail('${p.id}',this.checked)">Available</label></div>
+    ${p.variants.map(v => `<div class="row"><span style="flex:1">${esc(v.label)}</span><input style="width:110px" type="number" step="0.01" min="0" value="${v.price}" onchange="setPrice('${v.id}',this.value)"><button class="bad" onclick="arch('variants','${v.id}')" aria-label="Remove ${esc(v.label)}">✕</button></div>`).join('')}
+    <form class="row" onsubmit="addVar(event,'${p.id}')"><input placeholder="New size or flavor" required><input type="number" step="0.01" min="0" placeholder="Price" required style="width:110px"><button>Add</button></form>
+    <button class="bad" onclick="arch('products','${p.id}')">Remove product</button></div>`).join('');
+}
+const refresh = async () => { await load(); show('prods'); };
+async function addProd(e) {
+  e.preventDefault();
+  const { data: p, error } = await sb.from('products').insert({ name: $('#pn').value.trim() }).select().single();
+  if (error) return alert(error.message);
+  const r = await sb.from('variants').insert({ product_id: p.id, label: $('#pl').value.trim(), price: $('#pp').value });
+  if (r.error) alert(r.error.message); refresh();
+}
+async function addVar(e, pid) {
+  e.preventDefault(); const f = e.target.elements;
+  const { error } = await sb.from('variants').insert({ product_id: pid, label: f[0].value.trim(), price: f[1].value });
+  if (error) alert(error.message); refresh();
+}
+async function setAvail(id, v) { const { error } = await sb.from('products').update({ available: v }).eq('id', id); if (error) alert(error.message); refresh(); }
+async function setPrice(id, v) { const { error } = await sb.from('variants').update({ price: v }).eq('id', id); if (error) alert(error.message); refresh(); }
+async function arch(table, id) {
+  if (!confirm('Remove this? Past orders and reports are not affected.')) return;
+  const { error } = await sb.from(table).update({ archived: true }).eq('id', id); if (error) alert(error.message); refresh();
+}
+
+// ---------- sales ----------
+function dashView() {
+  return `<h1>Sales</h1><div class="card"><div class="row"><button onclick="setRange(0)">Today</button><button onclick="setRange(6)">7 days</button><button onclick="setRange(29)">30 days</button></div>
+    <div class="row"><input type="date" id="from"><input type="date" id="to"></div>
+    <button class="pri" style="width:100%" onclick="report()">Generate report</button></div><div id="rep"></div>`;
+}
+function setRange(n) { $('#from').value = manila(n); $('#to').value = manila(); report(); }
+let lastOrders = [];
+async function report() {
+  const f = $('#from').value, t = $('#to').value; if (!f || !t) return;
+  const mk = () => sb.from('orders').select('*,order_items(*)').eq('status', 'paid')
+    .gte('created_at', f + 'T00:00:00+08:00').lte('created_at', t + 'T23:59:59+08:00').order('created_at', { ascending: false });
+  let all = [];
+  for (let i = 0; ; i += 1000) {
+    const { data, error } = await mk().range(i, i + 999);
+    if (error) return alert(error.message);
+    all = all.concat(data); if (data.length < 1000) break;
+  }
+  lastOrders = all;
+  const sales = all.reduce((s, o) => s + +o.total, 0), qn = {}, rv = {};
+  all.forEach(o => o.order_items.forEach(i => { const k = i.name + ' ' + i.variant; qn[k] = (qn[k] || 0) + i.qty; rv[k] = (rv[k] || 0) + i.qty * i.price; }));
+  const top = (m, f) => Object.entries(m).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k, v]) => `<div class="row"><span>${esc(k)}</span><b>${f(v)}</b></div>`).join('') || '<p class="mut">No sales in this range.</p>';
+  $('#rep').innerHTML = `<div class="stats"><div class="card"><small>Sales</small><div class="big">${peso(sales)}</div></div>
+    <div class="card"><small>Orders</small><div class="big">${all.length}</div></div>
+    <div class="card"><small>Average</small><div class="big">${peso(all.length ? sales / all.length : 0)}</div></div></div>
+    <h1>Top by quantity</h1><div class="card">${top(qn, v => v)}</div><h1>Top by revenue</h1><div class="card">${top(rv, peso)}</div>
+    <button onclick="csv()" ${all.length ? '' : 'disabled'} style="width:100%">Download CSV</button>`;
+}
+function csv() {
+  const rows = [['order_no', 'date', 'items', 'total', 'cash', 'change']].concat(lastOrders.map(o =>
+    [o.order_no, fdt(o.created_at), o.order_items.map(i => `${i.qty}x ${i.name} ${i.variant}`).join('; '), o.total, o.cash, o.change_due]));
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([rows.map(r => r.map(x => `"${String(x).replace(/"/g, '""')}"`).join(',')).join('\n')], { type: 'text/csv' }));
+  a.download = `tamtam-sales-${$('#from').value}_${$('#to').value}.csv`; a.click();
+}
+
+// ---------- audit ----------
+const auditView = () => '<h1>Audit log</h1><p class="mut">Price changes and voided orders. This log cannot be edited.</p><div id="log"></div>';
+async function loadAudit() {
+  const { data, error } = await sb.from('audit_log').select('*').order('created_at', { ascending: false }).limit(200);
+  if (error) return alert(error.message);
+  $('#log').innerHTML = data.map(a => { const d = a.details; return `<div class="card"><span class="tag">${a.type === 'price_change' ? 'Price change' : 'Voided order'}</span>
+    <p>${a.type === 'price_change' ? `${esc(d.product)} (${esc(d.variant)}): ${peso(d.old)} → ${peso(d.new)}` : `Order #${d.order_no}, total ${peso(d.total)}`}</p><small>${fdt(a.created_at)}</small></div>`; }).join('') || '<p class="mut">Nothing logged yet.</p>';
+}
+boot();
+</script>
+</body>
+</html>
